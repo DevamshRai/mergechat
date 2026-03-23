@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output (regenerate with `npm run build`)
+dist/
+
+# Claude Code internal session data — never commit
+.claude/
+memory/
+.superpowers/
+
+# OS / editor
+*.docx
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Secrets (none used, but belt-and-suspenders)
+.env
+.env.local

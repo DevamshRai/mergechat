@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "MergeChat",
+  "version": "1.5.0",
+  "description": "Select two Claude.ai conversations, synthesize a unified memory, and continue in a new chat.",
+
+  "permissions": [
+    "tabs",
+    "scripting"
+  ],
+
+  "host_permissions": [
+    "https://claude.ai/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "MergeChat"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
