@@ -28,6 +28,17 @@ export default function Popup() {
 
   useEffect(() => () => { Object.values(hoverTimerRef.current).forEach(clearTimeout); }, []);
 
+  // Listen for status pushes from the background during a merge (e.g. chunking notice)
+  useEffect(() => {
+    function onMessage(message) {
+      if (message.type === 'MERGE_STATUS') {
+        setStatusMsg(message.message);
+      }
+    }
+    chrome.runtime.onMessage.addListener(onMessage);
+    return () => chrome.runtime.onMessage.removeListener(onMessage);
+  }, []);
+
   // ── Load conversations ──────────────────────────────────────────────────────
 
   async function handleLoad() {
