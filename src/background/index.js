@@ -15,6 +15,8 @@
 
 // Transcripts longer than this (chars) are split and pre-summarized before synthesis
 const CHUNK_SIZE = 4000;
+// Max chunk summary calls running at once (per conversation)
+const CHUNK_CONCURRENCY = 3;
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[MergeChat] Extension installed.');
@@ -60,14 +62,17 @@ async function handleMessage(message) {
       // Step 3: Format transcripts and condense long ones via chunk summarization
       const textA = formatTranscript(transcriptA);
       const textB = formatTranscript(transcriptB);
-      const needsChunking = textA.length > CHUNK_SIZE || textB.length > CHUNK_SIZE;
-      if (needsChunking) {
-        pushStatus('Long conversation detected — compressing for best results…');
-      }
-      const [condensedA, condensedB] = await Promise.all([
-        condenseTranscript(tab.id, orgId, textA),
-        condenseTranscript(tab.id, orgId, textB),
-      ]);
+      // Condense sequentially so per-chunk progress messages don't interleave
+      const condensedA = await condenseTranscript(
+        tab.id, orgId, textA,
+        convNames[0] || 'Conversation A',
+        (msg) => pushStatus(msg)
+      );
+      const condensedB = await condenseTranscript(
+        tab.id, orgId, textB,
+        convNames[1] || 'Conversation B',
+        (msg) => pushStatus(msg)
+      );
 
       let chatUrl;
       let realConvId;
@@ -242,14 +247,40 @@ ${chunk}
 }
 
 /**
+ * Summarize one chunk of transcript in its own throwaway conversation.
+ * On any failure, returns the raw chunk text so the merge can still proceed.
+ */
+async function summarizeOneChunk(tabId, orgId, chunk, idx, total) {
+  let tempConvId = null;
+  try {
+    const created = await contentCall(tabId, { type: 'CREATE_CONVERSATION', orgId });
+    tempConvId = created.uuid;
+    const summary = await contentCall(tabId, {
+      type: 'SEND_MESSAGE',
+      orgId,
+      convId: tempConvId,
+      text: buildChunkSummaryPrompt(chunk, idx + 1, total),
+    });
+    return `[PART ${idx + 1} OF ${total}]\n${summary || chunk}`;
+  } catch (_err) {
+    return chunk; // degrade gracefully — use raw chunk text
+  } finally {
+    if (tempConvId) {
+      contentCall(tabId, { type: 'DELETE_CONVERSATION', orgId, convId: tempConvId }).catch(() => {});
+    }
+  }
+}
+
+/**
  * If the formatted transcript exceeds CHUNK_SIZE, split it into chunks at
  * message boundaries, summarize each chunk via a lightweight API call, and
  * return the joined summaries. Short transcripts are returned as-is.
  *
- * Each chunk gets its own throwaway conversation (created → used → deleted).
- * Chunks are summarized in parallel for speed.
+ * Chunks are processed in batches of CHUNK_CONCURRENCY to cap API concurrency.
+ * Individual chunk failures fall back to raw text — the merge never aborts.
+ * onProgress(msg) is called after each batch with a human-readable status string.
  */
-async function condenseTranscript(tabId, orgId, formattedText) {
+async function condenseTranscript(tabId, orgId, formattedText, label = 'conversation', onProgress = () => {}) {
   if (formattedText.length <= CHUNK_SIZE) return formattedText;
 
   // Split at message boundaries (double newline) without breaking messages
@@ -269,24 +300,17 @@ async function condenseTranscript(tabId, orgId, formattedText) {
 
   if (chunks.length <= 1) return formattedText;
 
-  // Summarize all chunks in parallel, each in its own throwaway conversation
-  const summaries = await Promise.all(
-    chunks.map(async (chunk, i) => {
-      const tempConv = await contentCall(tabId, { type: 'CREATE_CONVERSATION', orgId });
-      const tempId = tempConv.uuid;
-      try {
-        const summary = await contentCall(tabId, {
-          type: 'SEND_MESSAGE',
-          orgId,
-          convId: tempId,
-          text: buildChunkSummaryPrompt(chunk, i + 1, chunks.length),
-        });
-        return `[PART ${i + 1} OF ${chunks.length}]\n${summary}`;
-      } finally {
-        contentCall(tabId, { type: 'DELETE_CONVERSATION', orgId, convId: tempId }).catch(() => {});
-      }
-    })
-  );
+  // Process chunks in batches of CHUNK_CONCURRENCY (max 3 concurrent API calls)
+  const summaries = [];
+  for (let i = 0; i < chunks.length; i += CHUNK_CONCURRENCY) {
+    const batch = chunks.slice(i, i + CHUNK_CONCURRENCY);
+    const batchSummaries = await Promise.all(
+      batch.map((chunk, j) => summarizeOneChunk(tabId, orgId, chunk, i + j, chunks.length))
+    );
+    summaries.push(...batchSummaries);
+    const completed = Math.min(i + CHUNK_CONCURRENCY, chunks.length);
+    onProgress(`Compressing ${label} — part ${completed} of ${chunks.length}…`);
+  }
 
   return summaries.join('\n\n');
 }
