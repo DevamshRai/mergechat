@@ -62,17 +62,19 @@ async function handleMessage(message) {
       // Step 3: Format transcripts and condense long ones via chunk summarization
       const textA = formatTranscript(transcriptA);
       const textB = formatTranscript(transcriptB);
-      // Condense sequentially so per-chunk progress messages don't interleave
-      const condensedA = await condenseTranscript(
-        tab.id, orgId, textA,
-        convNames[0] || 'Conversation A',
-        (msg) => pushStatus(msg)
-      );
-      const condensedB = await condenseTranscript(
-        tab.id, orgId, textB,
-        convNames[1] || 'Conversation B',
-        (msg) => pushStatus(msg)
-      );
+      // Fall back to a short id suffix when a conversation has no title, so the
+      // user can tell two untitled conversations apart in progress messages.
+      const labelFor = (name, id, slot) =>
+        name || `Conversation ${slot} (${String(id).slice(0, 6)})`;
+      const labelA = labelFor(convNames[0], convIds[0], 'A');
+      const labelB = labelFor(convNames[1], convIds[1], 'B');
+      // Condense in parallel — progress messages are prefixed with the
+      // conversation label, so interleaved output is still readable and
+      // wall-clock time roughly halves on long merges.
+      const [condensedA, condensedB] = await Promise.all([
+        condenseTranscript(tab.id, orgId, textA, labelA, (msg) => pushStatus(msg)),
+        condenseTranscript(tab.id, orgId, textB, labelB, (msg) => pushStatus(msg)),
+      ]);
 
       let chatUrl;
       let realConvId;
@@ -252,6 +254,7 @@ ${chunk}
  */
 async function summarizeOneChunk(tabId, orgId, chunk, idx, total) {
   let tempConvId = null;
+  const header = `[PART ${idx + 1} OF ${total}]`;
   try {
     const created = await contentCall(tabId, { type: 'CREATE_CONVERSATION', orgId });
     tempConvId = created.uuid;
@@ -261,9 +264,12 @@ async function summarizeOneChunk(tabId, orgId, chunk, idx, total) {
       convId: tempConvId,
       text: buildChunkSummaryPrompt(chunk, idx + 1, total),
     });
-    return `[PART ${idx + 1} OF ${total}]\n${summary || chunk}`;
-  } catch (_err) {
-    return chunk; // degrade gracefully — use raw chunk text
+    return `${header}\n${summary || chunk}`;
+  } catch (err) {
+    // Degrade gracefully — use raw chunk text, but keep the [PART] header
+    // so downstream synthesis sees a consistent structure across all parts.
+    console.warn('[MergeChat] chunk', idx + 1, 'of', total, 'failed, using raw text:', err);
+    return `${header}\n${chunk}`;
   } finally {
     if (tempConvId) {
       contentCall(tabId, { type: 'DELETE_CONVERSATION', orgId, convId: tempConvId }).catch(() => {});
@@ -298,18 +304,26 @@ async function condenseTranscript(tabId, orgId, formattedText, label = 'conversa
   }
   if (current) chunks.push(current);
 
+  // Edge case: text was over CHUNK_SIZE but contains no message boundaries
+  // (one giant message), so splitting produced a single chunk. Skip the
+  // summarize round-trip and return the original — summarizing a single chunk
+  // is wasted work.
   if (chunks.length <= 1) return formattedText;
 
-  // Process chunks in batches of CHUNK_CONCURRENCY (max 3 concurrent API calls)
+  // Process chunks in batches of CHUNK_CONCURRENCY (max 3 concurrent API calls).
+  // Fire progress BEFORE each batch so users see what's currently in flight,
+  // not what just finished — avoids long silent gaps during the API round-trip.
   const summaries = [];
   for (let i = 0; i < chunks.length; i += CHUNK_CONCURRENCY) {
     const batch = chunks.slice(i, i + CHUNK_CONCURRENCY);
+    const startNum = i + 1;
+    const endNum = Math.min(i + CHUNK_CONCURRENCY, chunks.length);
+    const range = startNum === endNum ? `part ${startNum}` : `parts ${startNum}–${endNum}`;
+    onProgress(`Compressing ${label} — ${range} of ${chunks.length}…`);
     const batchSummaries = await Promise.all(
       batch.map((chunk, j) => summarizeOneChunk(tabId, orgId, chunk, i + j, chunks.length))
     );
     summaries.push(...batchSummaries);
-    const completed = Math.min(i + CHUNK_CONCURRENCY, chunks.length);
-    onProgress(`Compressing ${label} — part ${completed} of ${chunks.length}…`);
   }
 
   return summaries.join('\n\n');
